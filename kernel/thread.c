@@ -74,6 +74,7 @@ thread_t *idle_thread;
 /* local routines */
 static void thread_resched(void);
 static void idle_thread_routine(void) __NO_RETURN;
+static bool thread_might_resched(void);
 
 #if PLATFORM_HAS_DYNAMIC_TIMER
 /* preemption timer */
@@ -367,6 +368,12 @@ static void idle_thread_routine(void)
 		arch_idle();
 }
 
+/* use the priority bitmap to decide which run queue to look into if we needed to reschedule */
+static inline int highest_sched_priority(void)
+{
+	return HIGHEST_PRIORITY - __builtin_clz(run_queue_bitmap) - (32 - NUM_PRIORITIES);
+}
+
 /**
  * @brief  Cause another thread to be executed.
  *
@@ -377,7 +384,7 @@ static void idle_thread_routine(void)
  * This is probably not the function you're looking for. See
  * thread_yield() instead.
  */
-void thread_resched(void)
+static void thread_resched(void)
 {
 	thread_t *oldthread;
 	thread_t *newthread;
@@ -401,7 +408,7 @@ void thread_resched(void)
 	ASSERT(run_queue_bitmap != 0);
 #endif
 
-	int next_queue = HIGHEST_PRIORITY - __builtin_clz(run_queue_bitmap) - (32 - NUM_PRIORITIES);
+	int next_queue = highest_sched_priority();
 	//dprintf(SPEW, "bitmap 0x%x, next %d\n", run_queue_bitmap, next_queue);
 
 	newthread = list_remove_head_type(&run_queue[next_queue], thread_t, queue_node);
@@ -466,6 +473,14 @@ void thread_resched(void)
 	arch_context_switch(oldthread, newthread);
 }
 
+/* if we yielded or preempted would there be a potential for reschedule */
+static bool thread_might_resched(void)
+{
+	DEBUG_ASSERT(in_critical_section());
+
+	return highest_sched_priority() >= current_thread->priority;
+}
+
 /**
  * @brief Yield the cpu to another thread
  *
@@ -486,11 +501,15 @@ void thread_yield(void)
 
 	THREAD_STATS_INC(yields);
 
-	/* we are yielding the cpu, so stick ourselves into the tail of the run queue and reschedule */
-	current_thread->state = THREAD_READY;
+	/* give up our quantum */
 	current_thread->remaining_quantum = 0;
-	insert_in_run_queue_tail(current_thread);
-	thread_resched();
+
+	if (thread_might_resched()) {
+		/* we are yielding the cpu, so stick ourselves into the tail of the run queue and reschedule */
+		current_thread->state = THREAD_READY;
+		insert_in_run_queue_tail(current_thread);
+		thread_resched();
+	}
 
 	exit_critical_section();
 }
@@ -526,13 +545,15 @@ void thread_preempt(void)
 
 	KEVLOG_THREAD_PREEMPT(current_thread);
 
-	/* we are being preempted, so we get to go back into the front of the run queue if we have quantum left */
-	current_thread->state = THREAD_READY;
-	if (current_thread->remaining_quantum > 0)
-		insert_in_run_queue_head(current_thread);
-	else
-		insert_in_run_queue_tail(current_thread); /* if we're out of quantum, go to the tail of the queue */
-	thread_resched();
+	if (thread_might_resched()) {
+		/* we are being preempted, so we get to go back into the front of the run queue if we have quantum left */
+		current_thread->state = THREAD_READY;
+		if (current_thread->remaining_quantum > 0)
+			insert_in_run_queue_head(current_thread);
+		else
+			insert_in_run_queue_tail(current_thread); /* if we're out of quantum, go to the tail of the queue */
+		thread_resched();
+	}
 
 	exit_critical_section();
 }
